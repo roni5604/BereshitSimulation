@@ -423,3 +423,6 @@ def show_full_data_table():
 # ===================== ANIMATION SETUP =====================
 ani = animation.FuncAnimation(fig_sim, update, interval=150, blit=True)
 plt.show()
+
+
+# Close the figure when done
