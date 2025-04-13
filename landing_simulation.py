@@ -56,6 +56,8 @@ class PID:
 
     def update(self, current, dt):
         error = current - self.setpoint
+        if abs(error) < 0.01:  # סף קרוב לאפס - לא נזיז יותר
+            return 0.0
         self.integral += error * dt
         # Anti-windup: clamp the integral term
         self.integral = max(-self.integral_limit, min(self.integral, self.integral_limit))
@@ -75,7 +77,7 @@ def desired_vs(alt, initial_alt):
     to a low value (3 m/s) near the ground.
     """
     vs_max = 25.0
-    vs_min = 3.0
+    vs_min = 3.0 ############
     ratio = alt / initial_alt  # ratio: 1 at start, 0 at ground
     return vs_min + (vs_max - vs_min) * ratio
 
@@ -84,7 +86,7 @@ def desired_hs(alt, initial_alt, hs_initial=932.0):
     Desired horizontal speed (m/s). We linearly reduce from hs_initial at the initial altitude
     to 0 m/s when alt <= 500 m.
     """
-    if alt <= 500:
+    if alt <= 1500:
         return 0.0
     return hs_initial * (alt / initial_alt)
 
@@ -103,7 +105,7 @@ class Spacecraft:
         self.NN   = 0.7          # throttle (0 to 1)
         self.acc  = 0.0          # engine acceleration magnitude (m/s²)
         self.landed = False
-        self.time = 0.0
+        self.time = 0
         self.initial_alt = self.alt
 
     def update_physics(self):
@@ -128,7 +130,7 @@ class Spacecraft:
         self.vs = max(0, self.vs + (MOON_ACC - a_thrust_vertical) * DT)
         # Update horizontal speed: subtract horizontal component of thrust.
         # נוסיף כפול (לדוגמה 1.5) אם hs גדול מהמטרה, כדי להאיץ את הבלימה.
-        factor = 1.5 if self.hs > desired_hs(self.alt, self.initial_alt) else 1.0
+        factor = 1.9 if self.hs > desired_hs(self.alt, self.initial_alt) else 1.0
         self.hs = max(0, self.hs - factor * a_thrust_horizontal * DT)
 
         # Update positions:
@@ -150,7 +152,7 @@ class Spacecraft:
     def get_state(self):
         return {
             "time": self.time,
-            "alt": self.alt,
+            "alt": self.alt,        # Is it alt or initial alt ??
             "vs": self.vs,
             "hs": self.hs,
             "dist": self.dist,
@@ -161,12 +163,44 @@ class Spacecraft:
             "landed": self.landed
         }
 
+def update_angle_by_hs(ship):
+    """
+    משנה את הזווית של החללית ב־5 שלבים לפי מהירות אופקית (hs)
+    בכל שלב מקטין את הזווית יותר עד שמגיע ל-0
+    """
+    hs = ship.hs
+    vs = ship.vs
+    alt = ship.alt
+    # הגדרת יעד זווית לפי מהירות אופקית
+    target_ang = 58.3
+
+    if hs > 0.1:
+        target_ang = 50.5
+    else:
+        target_ang = 0
+
+    # שינוי הדרגתי של הזווית כלפי יעד
+    angle_change_rate = 1.0  # מעלות לשנייה
+    ang_diff = target_ang - ship.ang
+    max_delta = angle_change_rate * DT
+    # הגבלה שלא נחרוג מקצב השינוי
+    if abs(ang_diff) > max_delta:
+        ang_diff = math.copysign(max_delta, ang_diff)
+
+    ship.ang += ang_diff
+    # נוודא שלא עוברים את הגבולות
+    ship.ang = max(-60, min(ship.ang, 60))
+
+
+
+
 # ===================== GLOBAL VARIABLES & DATA STORAGE =====================
 ship = Spacecraft()
 # PID for vertical speed control (affects throttle)
-vs_pid = PID(Kp=0.01, Ki=0.0002, Kd=0.002, integral_limit=100)
+vs_pid = PID(Kp=0.2, Ki=0.01, Kd=0.002, integral_limit=100)  # PID(Kp=0.2, Ki=0.01, Kd=0.8)
 # PID for horizontal speed control (affects angle)
-hs_pid = PID(Kp=0.004, Ki=0.0001, Kd=0.001, integral_limit=50)
+hs_pid = PID(Kp=0.005, Ki=0.0, Kd=0.01, integral_limit=50) # hs_pid = PID(Kp=0.005, Ki=0.0, Kd=0.01)
+
 
 running = False
 
@@ -296,8 +330,11 @@ def update(frame):
 
     # ========= DYNAMIC CONTROL LOGIC =========
     # Compute desired speeds based on current altitude:
-    vs_target = desired_vs(state["alt"], ship.initial_alt)
-    hs_target = desired_hs(state["alt"], ship.initial_alt, hs_initial=932.0)
+    # vs_target = desired_vs(state["alt"], ship.initial_alt)
+    # hs_target = desired_hs(state["alt"], ship.initial_alt, hs_initial=932.0)
+    vs_target = desired_vs(ship.alt, ship.initial_alt)
+    hs_target = desired_hs(ship.alt, ship.initial_alt, hs_initial=932.0)
+    # ======= New desired speed logic =======
 
     # --- Vertical PID: adjust throttle to reduce vs ---
     vs_pid.setpoint = vs_target
@@ -307,19 +344,19 @@ def update(frame):
     # --- Horizontal PID: adjust angle to reduce hs ---
     hs_pid.setpoint = hs_target
     out_hs = hs_pid.update(state["hs"], DT)
-    # נניח שכדי להאיץ ירידה של hs, נרצה להגביר את שינוי הזווית
-    # אם hs גבוה מהיעד, נשתמש בפקטור גדול יותר
-    factor = 2.0 if state["hs"] > hs_target else 1.0
-    d_ang = -factor * out_hs
-    max_dang = 3.0  # מקסימום שינוי זווית לשנייה
-    if abs(d_ang) > max_dang:
-        d_ang = math.copysign(max_dang, d_ang)
-    ship.ang += d_ang
-    # Clamp angle: כאשר נוחתים, נרצה זווית קרובה לאפס
-    ship.ang = max(-60, min(ship.ang, 60))
-    if state["alt"] < 500:
-        # כאשר alt נמוך, נעשה מעבר הדרגתי לזווית אנכית
-        ship.ang *= 0.95
+
+    # זווית
+    update_angle_by_hs(ship)
+
+    if ship.hs < 1.0:
+        # אנחנו בשלב האחרון של הנחיתה
+        landing_pid = PID(0.3, 0.0, 0.5, setpoint=10.0, integral_limit=50)
+        vs_target = 10 if ship.alt > 80 else 0.5  # יעד למהירות הנחיתה
+        landing_pid.setpoint = vs_target
+        out_vs = landing_pid.update(ship.vs, DT)
+
+
+
 
     # ========= UPDATE PHYSICS =========
     ship.update_physics()
